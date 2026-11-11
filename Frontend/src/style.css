@@ -38,6 +38,24 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* Surfaces du navigateur tirées de la palette. En couche base : les
+   utilitaires (ex. outline-none des champs) gardent la main. */
+@layer base {
+  ::selection {
+    background: var(--color-yellow);
+    color: var(--color-yellow-ink);
+  }
+
+  input {
+    caret-color: var(--color-blue);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-blue);
+    outline-offset: 2px;
+  }
+}
+
 .font-display {
   font-family: var(--font-display);
 }

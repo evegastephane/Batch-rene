@@ -22,7 +22,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use mmc_batch_core::{convertir, Demande, EntreeHistorique, Erreur, Historique, Mode};
+use mmc_batch_core::{convertir, Demande, ElementsAddAlias, EntreeHistorique, Erreur, Historique, Mode};
 use serde::Deserialize;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .expose_headers([
             header::CONTENT_DISPOSITION,
             HeaderName::from_static("x-nb-feuilles"),
+            HeaderName::from_static("x-nb-lignes"),
             HeaderName::from_static("x-historique-id"),
         ]);
 
@@ -118,23 +119,31 @@ async fn convertir_formulaire(
         contenu: Vec::new(),
         mode,
         style_entete: None,
-        montant: None,
-        titre: None,
-        description: None,
+        elements: ElementsAddAlias::default(),
     };
 
     while let Some(champ) = multipart.next_field().await.map_err(ErreurHttp::invalide)? {
-        match champ.name().unwrap_or("") {
-            "fichier" => {
-                demande.nom_fichier = champ.file_name().unwrap_or("").to_string();
-                demande.contenu = champ.bytes().await.map_err(ErreurHttp::invalide)?.to_vec();
-            }
-            "style_entete" => demande.style_entete = champ.text().await.ok(),
-            "montant" => demande.montant = champ.text().await.ok(),
-            "titre" => demande.titre = champ.text().await.ok(),
-            "description" => demande.description = champ.text().await.ok(),
-            _ => {}
+        let nom = champ.name().unwrap_or("").to_string();
+        if nom == "fichier" {
+            demande.nom_fichier = champ.file_name().unwrap_or("").to_string();
+            demande.contenu = champ.bytes().await.map_err(ErreurHttp::invalide)?.to_vec();
+            continue;
         }
+        let e = &mut demande.elements;
+        let cible = match nom.as_str() {
+            "style_entete" => &mut demande.style_entete,
+            "action" => &mut e.action,
+            "titre" => &mut e.titre,
+            "ext_id" => &mut e.ext_id,
+            "description" => &mut e.description,
+            "identifiant" => &mut e.identifiant,
+            "prefixe" => &mut e.prefixe,
+            "separateur" => &mut e.separateur,
+            "symbole" => &mut e.symbole,
+            "montant" => &mut e.montant,
+            _ => continue,
+        };
+        *cible = champ.text().await.ok();
     }
     if demande.nom_fichier.is_empty() {
         return Err(ErreurHttp(Erreur::Invalide("Fichier manquant.".into())));
@@ -144,8 +153,9 @@ async fn convertir_formulaire(
         .await
         .map_err(|e| ErreurHttp(Erreur::Interne(e.to_string())))??;
 
-    let mut entetes = zip_entetes(&conversion.nom_zip)?;
+    let mut entetes = fichier_entetes(&conversion.nom_zip)?;
     entetes.insert("x-nb-feuilles", HeaderValue::from(conversion.nb_feuilles));
+    entetes.insert("x-nb-lignes", HeaderValue::from(conversion.nb_lignes));
     entetes.insert("x-historique-id", HeaderValue::from(conversion.historique_id));
     Ok((entetes, Body::from(conversion.zip)).into_response())
 }
@@ -167,7 +177,7 @@ async fn telecharger_historique(
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Response, ErreurHttp> {
     let (nom, octets) = historique.lire_zip(id)?;
-    Ok((zip_entetes(&nom)?, Body::from(octets)).into_response())
+    Ok((fichier_entetes(&nom)?, Body::from(octets)).into_response())
 }
 
 async fn supprimer_historique(
@@ -178,9 +188,14 @@ async fn supprimer_historique(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-fn zip_entetes(nom: &str) -> Result<HeaderMap, ErreurHttp> {
+fn fichier_entetes(nom: &str) -> Result<HeaderMap, ErreurHttp> {
+    let type_contenu = if nom.to_ascii_lowercase().ends_with(".xlsx") {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    } else {
+        "application/zip"
+    };
     let mut entetes = HeaderMap::new();
-    entetes.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+    entetes.insert(header::CONTENT_TYPE, HeaderValue::from_static(type_contenu));
     let disposition = HeaderValue::from_str(&format!("attachment; filename={nom}"))
         .map_err(|e| ErreurHttp(Erreur::Interne(e.to_string())))?;
     entetes.insert(header::CONTENT_DISPOSITION, disposition);

@@ -44,9 +44,18 @@ function zipEnBlob(octets) {
 
 /**
  * Convertit un classeur Excel.
- * @returns {Promise<{ nomZip: string, nbFeuilles: number, blob: Blob }>}
+ * @returns {Promise<{ nomZip: string, nbFeuilles: number, nbLignes: number, blob: Blob }>}
  */
-export async function convertir({ fichier, mode, styleEntete, montant, titre, description }) {
+export async function convertir({
+  fichier,
+  mode,
+  styleEntete,
+  montant,
+  titre,
+  description,
+  profil,
+  raison
+}) {
   if (dansTauri) {
     const contenu = Array.from(new Uint8Array(await fichier.arrayBuffer()))
     const resultat = await appeler('convertir', {
@@ -57,12 +66,15 @@ export async function convertir({ fichier, mode, styleEntete, montant, titre, de
         style_entete: styleEntete,
         montant,
         titre,
-        description
+        description,
+        profil,
+        raison
       }
     })
     return {
       nomZip: resultat.nom_zip,
       nbFeuilles: resultat.nb_feuilles,
+      nbLignes: resultat.nb_lignes,
       blob: zipEnBlob(resultat.zip)
     }
   }
@@ -70,17 +82,22 @@ export async function convertir({ fichier, mode, styleEntete, montant, titre, de
   const formulaire = new FormData()
   formulaire.append('fichier', fichier)
   formulaire.append('style_entete', styleEntete)
-  if (mode === 'crplmt') {
-    formulaire.append('montant', montant)
+  if (mode === 'crplmt') formulaire.append('montant', montant)
+  if (mode === 'migration') {
+    formulaire.append('profil', profil)
+    formulaire.append('raison', raison)
+  }
+  if (mode !== 'standard') {
     formulaire.append('titre', titre)
     formulaire.append('description', description)
   }
-  const chemin = mode === 'crplmt' ? '/convert/crplmt' : '/convert'
+  const chemin = { standard: '/convert', crplmt: '/convert/crplmt', migration: '/convert/migration' }[mode]
   const reponse = await requeteServeur(chemin, { method: 'POST', body: formulaire })
   const disposition = reponse.headers.get('content-disposition') || ''
   return {
     nomZip: /filename=([^;]+)/.exec(disposition)?.[1]?.trim() || 'export.zip',
     nbFeuilles: Number(reponse.headers.get('x-nb-feuilles')) || 0,
+    nbLignes: Number(reponse.headers.get('x-nb-lignes')) || 0,
     blob: await reponse.blob()
   }
 }

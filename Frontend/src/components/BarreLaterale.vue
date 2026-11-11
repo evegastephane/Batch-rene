@@ -57,12 +57,15 @@ function formaterKo(octets) {
               <span class="shrink-0 font-mono text-[10px] text-ink-soft pt-0.5">{{ formaterKo(entree.taille_octets) }}</span>
             </div>
 
-            <div class="mt-0.5 flex items-center justify-between">
-              <span class="font-mono text-[10px] text-ink-soft">
-                {{ formaterDate(entree.date_creation) }} · {{ entree.nb_feuilles }} feuilles
+            <div class="mt-1 flex items-center justify-between gap-2">
+              <span class="flex min-w-0 items-center gap-1.5 font-mono text-[10px] text-ink-soft">
+                <span class="shrink-0 rounded-sm bg-blue-dim px-1 font-medium leading-4 text-blue">{{ entree.style_entete }}</span>
+                <span class="truncate">
+                  {{ formaterDate(entree.date_creation) }}<template v-if="entree.nb_feuilles > 1"> · {{ entree.nb_feuilles }} fichiers</template>
+                </span>
               </span>
 
-              <div class="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+              <div class="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
                 <button
                   type="button"
                   @click="emit('telecharger', entree)"

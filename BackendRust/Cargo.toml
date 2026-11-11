@@ -21,6 +21,8 @@ serveur = ["dep:anyhow", "dep:axum", "dep:serde_json", "dep:tokio", "dep:tower-h
 [dependencies]
 calamine = "0.26"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Sortie CRPLMT : classeur .xlsx
+rust_xlsxwriter = "0.99"
 serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 zip = "2"

@@ -1,0 +1,12 @@
+# Generated local data
+outputs/
+# Local assistant configuration
+.claude/launch.json
+# Dependencies and build artifacts
+node_modules/
+target/
+dist/
+# Local secrets
+.env
+.env.*
+!.env.example

@@ -12,14 +12,23 @@ use std::{
 
 use calamine::{open_workbook_auto_from_rs, Data, Reader};
 use rusqlite::{params, Connection};
+use rust_xlsxwriter::{Workbook, XlsxError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
-pub const CRPLMT_MONTANT_DEFAUT: &str = "100000";
+// Elements par defaut des lignes AddAlias (mode CRPLMT), modifiables dans le formulaire :
+// HDR,"<action>","<titre>","<ext_id>","<nb>","<description>","1"
+// <identifiant>,"<numero>","<prefixe><separateur><numero><symbole><montant>"
+pub const ADD_ALIAS_ACTION_DEFAUT: &str = "AddAlias";
 pub const ADD_ALIAS_TITRE_DEFAUT: &str = "Add Alias Title";
+pub const ADD_ALIAS_EXT_ID_DEFAUT: &str = "ExtId12340";
 pub const ADD_ALIAS_DESCRIPTION_DEFAUT: &str = "Agent  advance pilote";
-const CRPLMT_PREFIXE: &str = "CRPLMT";
+pub const CRPLMT_IDENTIFIANT_DEFAUT: &str = "MSISDN";
+pub const CRPLMT_PREFIXE_DEFAUT: &str = "CRPLMT";
+pub const CRPLMT_SEPARATEUR_DEFAUT: &str = "_";
+pub const CRPLMT_SYMBOLE_DEFAUT: &str = "@";
+pub const CRPLMT_MONTANT_DEFAUT: &str = "100000";
 
 // ---------------------------------------------------------------------------
 // Erreurs
@@ -63,6 +72,12 @@ impl From<zip::result::ZipError> for Erreur {
     }
 }
 
+impl From<XlsxError> for Erreur {
+    fn from(e: XlsxError) -> Self {
+        Erreur::Interne(format!("Creation du classeur Excel : {e}"))
+    }
+}
+
 pub type Resultat<T> = std::result::Result<T, Erreur>;
 
 // ---------------------------------------------------------------------------
@@ -76,7 +91,8 @@ pub enum Mode {
     /// `UpdateIndividualRatingParameter` (Init ou Set), un CSV par feuille.
     #[default]
     Standard,
-    /// Colonne de numeros : produit le fichier `AddAlias` (.txt) avec une ligne
+    /// Colonne de numeros : produit un classeur .xlsx dont la colonne A contient
+    /// l'entete `HDR,"AddAlias",...` puis une ligne
     /// `MSISDN,"<numero>","CRPLMT_<numero>@<montant>"` par numero.
     Crplmt,
 }
@@ -91,23 +107,40 @@ pub struct Demande {
     #[serde(default)]
     pub style_entete: Option<String>,
     /// Mode CRPLMT.
-    #[serde(default)]
-    pub montant: Option<String>,
-    #[serde(default)]
+    #[serde(flatten)]
+    pub elements: ElementsAddAlias,
+}
+
+/// Elements des lignes AddAlias saisis dans le formulaire (mode CRPLMT).
+/// Un element absent ou vide prend sa valeur par defaut.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ElementsAddAlias {
+    // Entete HDR
+    pub action: Option<String>,
     pub titre: Option<String>,
-    #[serde(default)]
+    pub ext_id: Option<String>,
     pub description: Option<String>,
+    // Ligne de chaque numero
+    pub identifiant: Option<String>,
+    pub prefixe: Option<String>,
+    pub separateur: Option<String>,
+    pub symbole: Option<String>,
+    pub montant: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Conversion {
+    /// Fichier produit : zip de CSV (Standard) ou classeur .xlsx (CRPLMT).
     pub nom_zip: String,
     pub nb_feuilles: usize,
+    /// Lignes de donnees ecrites, entetes HDR non comprises.
+    pub nb_lignes: usize,
     pub historique_id: i64,
     pub zip: Vec<u8>,
 }
 
-/// Convertit le classeur, enregistre le zip dans l'historique et le renvoie.
+/// Convertit le classeur, enregistre le fichier produit dans l'historique et le renvoie.
 pub fn convertir(historique: &Historique, demande: Demande) -> Resultat<Conversion> {
     if !a_extension_excel(&demande.nom_fichier) {
         return Err(Erreur::Invalide(
@@ -116,45 +149,50 @@ pub fn convertir(historique: &Historique, demande: Demande) -> Resultat<Conversi
     }
     let base = sans_extension(&demande.nom_fichier);
 
-    let (fichiers, nom_zip, type_entete) = match demande.mode {
+    let (sortie, nom_sortie, nb_feuilles, nb_lignes, type_entete) = match demande.mode {
         Mode::Standard => {
             let style = if demande.style_entete.as_deref() == Some("Set") {
                 "Set"
             } else {
                 "Init"
             };
-            let fichiers = fichiers_standard(&demande.contenu, style)?;
-            (fichiers, format!("{base}_csv.zip"), style.to_string())
+            let (fichiers, nb_lignes) = fichiers_standard(&demande.contenu, style)?;
+            (
+                construire_zip(&fichiers)?,
+                format!("{base}_csv.zip"),
+                fichiers.len(),
+                nb_lignes,
+                style.to_string(),
+            )
         }
         Mode::Crplmt => {
-            let montant = valeur_ou_defaut(&demande.montant, CRPLMT_MONTANT_DEFAUT);
-            if !montant.chars().all(|c| c.is_ascii_digit()) {
-                return Err(Erreur::Invalide(
-                    "Le montant doit etre un nombre entier (ex. 100000).".into(),
-                ));
-            }
-            let titre = valeur_ou_defaut(&demande.titre, ADD_ALIAS_TITRE_DEFAUT);
-            let description = valeur_ou_defaut(&demande.description, ADD_ALIAS_DESCRIPTION_DEFAUT);
-            if titre.contains('"') || description.contains('"') {
-                return Err(Erreur::Invalide(
-                    "Le titre et la description ne doivent pas contenir de guillemets.".into(),
-                ));
-            }
-            let fichiers =
-                fichiers_add_alias(&demande.contenu, base, &montant, &titre, &description)?;
-            (fichiers, format!("{base}_AddAlias.zip"), "AddAlias".to_string())
+            let elements = demande.elements.resoudre()?;
+            let feuilles = feuilles_de_numeros(&demande.contenu)?;
+            let nb_lignes = feuilles.iter().map(|(_, numeros)| numeros.len()).sum();
+            (
+                classeur_add_alias(&feuilles, &elements)?,
+                format!("{base}_AddAlias.xlsx"),
+                feuilles.len(),
+                nb_lignes,
+                "AddAlias".to_string(),
+            )
         }
     };
 
-    let zip = construire_zip(&fichiers)?;
-    let historique_id =
-        historique.enregistrer(&demande.nom_fichier, &nom_zip, &zip, fichiers.len(), &type_entete)?;
+    let historique_id = historique.enregistrer(
+        &demande.nom_fichier,
+        &nom_sortie,
+        &sortie,
+        nb_feuilles,
+        &type_entete,
+    )?;
 
     Ok(Conversion {
-        nom_zip,
-        nb_feuilles: fichiers.len(),
+        nom_zip: nom_sortie,
+        nb_feuilles,
+        nb_lignes,
         historique_id,
-        zip,
+        zip: sortie,
     })
 }
 
@@ -174,6 +212,10 @@ fn a_extension_excel(nom: &str) -> bool {
 
 fn sans_extension(nom: &str) -> &str {
     nom.rsplit_once('.').map(|(base, _)| base).unwrap_or(nom)
+}
+
+fn extension(nom: &str) -> &str {
+    nom.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("zip")
 }
 
 // ---------------------------------------------------------------------------
@@ -229,9 +271,14 @@ fn nom_de_fichier(nom: &str) -> String {
 // Mode standard : entete UpdateIndividualRatingParameter
 // ---------------------------------------------------------------------------
 
-fn fichiers_standard(contenu: &[u8], style: &str) -> Resultat<Vec<(String, Vec<u8>)>> {
+/// Fichiers produits et nombre total de lignes de donnees.
+type Fichiers = (Vec<(String, Vec<u8>)>, usize);
+
+fn fichiers_standard(contenu: &[u8], style: &str) -> Resultat<Fichiers> {
     let mut fichiers = Vec::new();
+    let mut nb_lignes = 0;
     for (feuille, lignes) in lire_feuilles(contenu)? {
+        nb_lignes += lignes.len();
         let parametre = parametre_le_plus_frequent(&lignes).unwrap_or_else(|| feuille.clone());
 
         let mut csv = entete_standard(lignes.len(), style, &parametre);
@@ -246,7 +293,7 @@ fn fichiers_standard(contenu: &[u8], style: &str) -> Resultat<Vec<(String, Vec<u
         octets.extend_from_slice(csv.as_bytes());
         fichiers.push((format!("{}.csv", nom_de_fichier(&feuille)), octets));
     }
-    Ok(fichiers)
+    Ok((fichiers, nb_lignes))
 }
 
 fn entete_standard(nb_lignes: usize, style: &str, parametre: &str) -> String {
@@ -284,18 +331,79 @@ fn parametre_le_plus_frequent(lignes: &[Vec<String>]) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Mode CRPLMT : fichier AddAlias
+// Mode CRPLMT : classeur AddAlias
 // ---------------------------------------------------------------------------
 
-/// Un .txt AddAlias par feuille contenant des numeros (CRLF, sans BOM,
-/// comme le template d'import).
-fn fichiers_add_alias(
-    contenu: &[u8],
-    base: &str,
-    montant: &str,
-    titre: &str,
-    description: &str,
-) -> Resultat<Vec<(String, Vec<u8>)>> {
+/// Elements AddAlias avec les valeurs par defaut appliquees et controlees.
+struct LigneAddAlias {
+    action: String,
+    titre: String,
+    ext_id: String,
+    description: String,
+    identifiant: String,
+    prefixe: String,
+    separateur: String,
+    symbole: String,
+    montant: String,
+}
+
+impl ElementsAddAlias {
+    fn resoudre(&self) -> Resultat<LigneAddAlias> {
+        let e = LigneAddAlias {
+            action: valeur_ou_defaut(&self.action, ADD_ALIAS_ACTION_DEFAUT),
+            titre: valeur_ou_defaut(&self.titre, ADD_ALIAS_TITRE_DEFAUT),
+            ext_id: valeur_ou_defaut(&self.ext_id, ADD_ALIAS_EXT_ID_DEFAUT),
+            description: valeur_ou_defaut(&self.description, ADD_ALIAS_DESCRIPTION_DEFAUT),
+            identifiant: jeton_ou_defaut(&self.identifiant, CRPLMT_IDENTIFIANT_DEFAUT),
+            prefixe: jeton_ou_defaut(&self.prefixe, CRPLMT_PREFIXE_DEFAUT),
+            separateur: jeton_ou_defaut(&self.separateur, CRPLMT_SEPARATEUR_DEFAUT),
+            symbole: jeton_ou_defaut(&self.symbole, CRPLMT_SYMBOLE_DEFAUT),
+            montant: jeton_ou_defaut(&self.montant, CRPLMT_MONTANT_DEFAUT),
+        };
+
+        if !e.montant.chars().all(|c| c.is_ascii_digit()) {
+            return Err(Erreur::Invalide(
+                "Le montant doit etre un nombre entier (ex. 100000).".into(),
+            ));
+        }
+        // Un guillemet fermerait la valeur entre guillemets avant la fin
+        for (nom, valeur) in [
+            ("Action", &e.action),
+            ("Titre", &e.titre),
+            ("ExtId", &e.ext_id),
+            ("Description", &e.description),
+            ("Identifiant", &e.identifiant),
+            ("Prefixe", &e.prefixe),
+            ("Separateur", &e.separateur),
+            ("Symbole", &e.symbole),
+        ] {
+            if valeur.contains('"') {
+                return Err(Erreur::Invalide(format!(
+                    "{nom} : les guillemets ne sont pas acceptes."
+                )));
+            }
+        }
+        // Seul element hors guillemets : une virgule decalerait les colonnes
+        if e.identifiant.contains(',') {
+            return Err(Erreur::Invalide(
+                "Identifiant : la virgule n'est pas acceptee.".into(),
+            ));
+        }
+        Ok(e)
+    }
+}
+
+/// Element court de la ligne (MSISDN, CRPLMT, _, @, montant) : sans les espaces
+/// autour, ou la valeur par defaut s'il est absent ou vide.
+fn jeton_ou_defaut(valeur: &Option<String>, defaut: &str) -> String {
+    match valeur.as_deref().map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => defaut.to_string(),
+    }
+}
+
+/// Feuilles contenant des numeros, avec leurs numeros.
+fn feuilles_de_numeros(contenu: &[u8]) -> Resultat<Vec<(String, Vec<String>)>> {
     let mut feuilles = Vec::new();
     for (feuille, lignes) in lire_feuilles(contenu)? {
         let numeros = extraire_numeros(&lignes)
@@ -308,19 +416,7 @@ fn fichiers_add_alias(
     if feuilles.is_empty() {
         return Err(Erreur::Invalide("Aucun numero trouve dans le fichier.".into()));
     }
-
-    let une_seule = feuilles.len() == 1;
-    Ok(feuilles
-        .into_iter()
-        .map(|(feuille, numeros)| {
-            let nom = if une_seule {
-                format!("{}.txt", nom_de_fichier(base))
-            } else {
-                format!("{}_{}.txt", nom_de_fichier(base), nom_de_fichier(&feuille))
-            };
-            (nom, add_alias(&numeros, montant, titre, description).into_bytes())
-        })
-        .collect())
+    Ok(feuilles)
 }
 
 /// Premiere cellule non vide de chaque ligne. Une premiere ligne non numerique
@@ -345,17 +441,45 @@ fn extraire_numeros(lignes: &[Vec<String>]) -> std::result::Result<Vec<String>, 
     Ok(numeros)
 }
 
-fn add_alias(numeros: &[String], montant: &str, titre: &str, description: &str) -> String {
-    let mut texte = format!(
-        "HDR,\"AddAlias\",\"{titre}\",\"ExtId12340\",\"{}\",\"{description}\",\"1\"\r\n",
-        numeros.len()
-    );
-    for numero in numeros {
-        texte.push_str(&format!(
-            "MSISDN,\"{numero}\",\"{CRPLMT_PREFIXE}_{numero}@{montant}\"\r\n"
-        ));
+/// L'entete HDR puis une ligne `MSISDN,"<numero>","CRPLMT_<numero>@<montant>"` par numero.
+fn add_alias(numeros: &[String], e: &LigneAddAlias) -> Vec<String> {
+    let mut lignes = Vec::with_capacity(numeros.len() + 1);
+    lignes.push(format!(
+        "HDR,\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"1\"",
+        e.action,
+        e.titre,
+        e.ext_id,
+        numeros.len(),
+        e.description
+    ));
+    lignes.extend(numeros.iter().map(|numero| {
+        format!(
+            "{},\"{numero}\",\"{}{}{numero}{}{}\"",
+            e.identifiant, e.prefixe, e.separateur, e.symbole, e.montant
+        )
+    }));
+    lignes
+}
+
+/// Classeur de sortie : une feuille par feuille source, une ligne AddAlias par
+/// cellule de la colonne A (comme les classeurs prepares a la main).
+fn classeur_add_alias(
+    feuilles: &[(String, Vec<String>)],
+    elements: &LigneAddAlias,
+) -> Resultat<Vec<u8>> {
+    let mut classeur = Workbook::new();
+    for (nom, numeros) in feuilles {
+        let lignes = add_alias(numeros, elements);
+        let onglet = classeur.add_worksheet();
+        onglet.set_name(nom)?;
+        // Colonne assez large pour lire chaque ligne en entier
+        let largeur = lignes.iter().map(|l| l.chars().count()).max().unwrap_or(0) + 2;
+        onglet.set_column_width(0, largeur.min(255) as f64)?;
+        for (index, ligne) in lignes.iter().enumerate() {
+            onglet.write_string(index as u32, 0, ligne)?;
+        }
     }
-    texte
+    Ok(classeur.save_to_buffer()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +504,8 @@ fn construire_zip(fichiers: &[(String, Vec<u8>)]) -> Resultat<Vec<u8>> {
 pub struct EntreeHistorique {
     pub id: i64,
     pub nom_original: String,
+    /// Fichier produit : .zip (Standard) ou .xlsx (CRPLMT). Le nom de colonne
+    /// date d'avant la sortie .xlsx et reste pour les bases existantes.
     pub nom_zip: String,
     pub chemin_zip: String,
     pub nb_feuilles: i64,
@@ -455,7 +581,7 @@ impl Historique {
     ) -> Resultat<i64> {
         let chemin = self
             .dossier_zips
-            .join(format!("{}.zip", Uuid::new_v4().simple()));
+            .join(format!("{}.{}", Uuid::new_v4().simple(), extension(nom_zip)));
         std::fs::write(&chemin, zip)?;
 
         let connexion = self.connexion()?;
@@ -497,7 +623,7 @@ impl Historique {
         }
     }
 
-    /// Nom et contenu du zip d'une conversion passee.
+    /// Nom et contenu du fichier produit par une conversion passee.
     pub fn lire_zip(&self, id: i64) -> Resultat<(String, Vec<u8>)> {
         let entree = self.entree(id)?;
         let octets = std::fs::read(&entree.chemin_zip).map_err(|_| {
@@ -586,17 +712,46 @@ mod tests {
 
     #[test]
     fn add_alias_identique_au_template() {
+        let elements = ElementsAddAlias::default().resoudre().unwrap();
         let numeros = vec!["237653282055".to_string(), "237679447586".to_string()];
         assert_eq!(
-            add_alias(
-                &numeros,
-                CRPLMT_MONTANT_DEFAUT,
-                ADD_ALIAS_TITRE_DEFAUT,
-                ADD_ALIAS_DESCRIPTION_DEFAUT
-            ),
-            "HDR,\"AddAlias\",\"Add Alias Title\",\"ExtId12340\",\"2\",\"Agent  advance pilote\",\"1\"\r\n\
-             MSISDN,\"237653282055\",\"CRPLMT_237653282055@100000\"\r\n\
-             MSISDN,\"237679447586\",\"CRPLMT_237679447586@100000\"\r\n"
+            add_alias(&numeros, &elements),
+            vec![
+                "HDR,\"AddAlias\",\"Add Alias Title\",\"ExtId12340\",\"2\",\"Agent  advance pilote\",\"1\"",
+                "MSISDN,\"237653282055\",\"CRPLMT_237653282055@100000\"",
+                "MSISDN,\"237679447586\",\"CRPLMT_237679447586@100000\"",
+            ]
         );
+    }
+
+    #[test]
+    fn add_alias_elements_du_formulaire() {
+        let elements = ElementsAddAlias {
+            identifiant: Some(" MSISDN ".into()),
+            prefixe: Some("PROMO".into()),
+            separateur: Some("-".into()),
+            symbole: Some("#".into()),
+            montant: Some("50000".into()),
+            ext_id: Some("ExtId999".into()),
+            ..Default::default()
+        }
+        .resoudre()
+        .unwrap();
+        let lignes = add_alias(&["237671598153".to_string()], &elements);
+        assert_eq!(
+            lignes[0],
+            "HDR,\"AddAlias\",\"Add Alias Title\",\"ExtId999\",\"1\",\"Agent  advance pilote\",\"1\""
+        );
+        assert_eq!(lignes[1], "MSISDN,\"237671598153\",\"PROMO-237671598153#50000\"");
+    }
+
+    #[test]
+    fn add_alias_elements_invalides_refuses() {
+        let montant = ElementsAddAlias { montant: Some("10a".into()), ..Default::default() };
+        assert!(montant.resoudre().is_err());
+        let guillemet = ElementsAddAlias { prefixe: Some("CR\"PL".into()), ..Default::default() };
+        assert!(guillemet.resoudre().is_err());
+        let virgule = ElementsAddAlias { identifiant: Some("MS,ISDN".into()), ..Default::default() };
+        assert!(virgule.resoudre().is_err());
     }
 }

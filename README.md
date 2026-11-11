@@ -12,6 +12,18 @@ Application de bureau (Tauri + Vue) qui convertit des classeurs Excel en fichier
   ```
 
   Montant, titre et description sont modifiables dans l'interface.
+- **Migration** : une colonne de numéros (avec un titre) → fichier `SetProfile` `.csv` :
+
+  ```
+  HDR,"SetProfile","SetProfile Title","ExtId20240724","<nb>","SetProfile rollback","1"
+  MSISDN,237671598153,<Profil>,<Raison>
+  ```
+
+  Profil et raison peuvent rester vides (`MSISDN,237671598153,,`) ; ils ne doivent contenir ni
+  virgule ni guillemet. Un numéro à 9 chiffres reçoit l'indicatif `237`. Titre et description
+  de l'en-tête sont modifiables.
+
+L'interface affiche un aperçu des premières lignes du fichier produit avant le dépôt.
 
 Le résultat est un zip, gardé dans l'historique (retéléchargeable depuis le panneau de gauche).
 

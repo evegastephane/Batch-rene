@@ -105,6 +105,71 @@ fn crplmt_montant_invalide_refuse() {
 }
 
 #[test]
+fn migration_produit_le_fichier_set_profile() {
+    let historique = historique_temporaire("migration");
+    let conversion = convertir(
+        &historique,
+        demande(
+            serde_json::json!({ "nom_fichier": "liste.xlsx", "mode": "migration" }),
+            "msisdn.xlsx",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(conversion.nom_zip, "liste_SetProfile.zip");
+    assert_eq!(conversion.nb_feuilles, 1);
+    assert_eq!(conversion.nb_lignes, 3);
+
+    let fichiers = fichiers_du_zip(&conversion.zip);
+    assert_eq!(fichiers.len(), 1);
+    assert_eq!(fichiers[0].0, "liste.csv");
+    assert_eq!(
+        String::from_utf8(fichiers[0].1.clone()).unwrap(),
+        "HDR,\"SetProfile\",\"SetProfile Title\",\"ExtId20240724\",\"3\",\"SetProfile rollback\",\"1\"\r\n\
+         MSISDN,237600000001,,\r\n\
+         MSISDN,237600000002,,\r\n\
+         MSISDN,237600000003,,\r\n"
+    );
+    assert_eq!(historique.lister(50).unwrap()[0].style_entete, "SetProfile");
+}
+
+#[test]
+fn migration_profil_et_raison_ecrits_sur_chaque_ligne() {
+    let historique = historique_temporaire("migration-profil");
+    let conversion = convertir(
+        &historique,
+        demande(
+            serde_json::json!({
+                "nom_fichier": "liste.xlsx",
+                "mode": "migration",
+                "profil": "MTNC Agent Promo Profile 1.5",
+                "raison": "FIELD AZURE MIGRATION"
+            }),
+            "msisdn.xlsx",
+        ),
+    )
+    .unwrap();
+    let texte = String::from_utf8(fichiers_du_zip(&conversion.zip)[0].1.clone()).unwrap();
+    assert!(texte.contains(
+        "\r\nMSISDN,237600000003,MTNC Agent Promo Profile 1.5,FIELD AZURE MIGRATION\r\n"
+    ));
+}
+
+#[test]
+fn migration_virgule_dans_le_profil_refusee() {
+    let historique = historique_temporaire("migration-virgule");
+    let erreur = convertir(
+        &historique,
+        demande(
+            serde_json::json!({ "nom_fichier": "liste.xlsx", "mode": "migration", "profil": "A,B" }),
+            "msisdn.xlsx",
+        ),
+    )
+    .unwrap_err();
+    assert!(erreur.to_string().contains("virgule"));
+}
+
+#[test]
 fn standard_ajoute_l_entete_update_individual_rating_parameter() {
     let historique = historique_temporaire("standard");
     let conversion = convertir(

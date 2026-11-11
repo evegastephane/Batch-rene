@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import {
   FileSpreadsheet,
   UploadCloud,
@@ -12,7 +12,8 @@ import {
   AlignLeft,
   Rows3,
   Table2,
-  Phone
+  Phone,
+  UserCog
 } from 'lucide-vue-next'
 import EnTete from './components/EnTete.vue'
 import BarreLaterale from './components/BarreLaterale.vue'
@@ -25,14 +26,29 @@ const modes = [
   {
     valeur: 'standard',
     label: 'Standard',
-    description: 'Classeur déjà au format MSISDN,…,Paramètre',
-    icone: Table2
+    description: 'Classeur déjà au format MSISDN,…,Paramètre → un CSV par feuille',
+    icone: Table2,
+    titre: ['Chaque feuille devient', 'un CSV autonome.'],
+    intro:
+      'Dépose un classeur Excel. Chaque feuille en ressort avec son propre titre généré et son propre fichier, regroupés dans un zip.'
   },
   {
     valeur: 'crplmt',
     label: 'CRPLMT',
-    description: 'Colonne de numéros → fichier AddAlias .txt (MSISDN,"numéro","CRPLMT_numéro@montant")',
-    icone: Phone
+    description: 'Colonne de numéros → fichier AddAlias .txt',
+    icone: Phone,
+    titre: ['Une colonne de numéros,', 'un fichier AddAlias.'],
+    intro:
+      'Dépose la liste des numéros. Chaque numéro devient une ligne CRPLMT au montant choisi, prête pour l’import.'
+  },
+  {
+    valeur: 'migration',
+    label: 'Migration',
+    description: 'Colonne de numéros → fichier SetProfile .csv',
+    icone: UserCog,
+    titre: ['Une colonne de numéros,', 'un fichier SetProfile.'],
+    intro:
+      'Dépose la liste des numéros. Chaque numéro reçoit le profil et la raison indiqués, sous l’en-tête SetProfile. Laissés vides, ils restent vides dans le fichier.'
   }
 ]
 
@@ -41,13 +57,108 @@ const options = [
   { valeur: 'Set', label: 'Set', description: 'Modification', icone: Rows3 }
 ]
 
-const modeConversion = ref('standard') // standard | crplmt
+const modeConversion = ref('standard') // standard | crplmt | migration
+const modeActif = computed(() => modes.find((m) => m.valeur === modeConversion.value))
 const styleEntete = ref('Init')
-const montant = ref('100000')
-const titreAlias = ref('Add Alias Title')
-const descriptionAlias = ref('Agent  advance pilote')
 
-const montantValide = computed(() => /^\d+$/.test(montant.value.trim()))
+// Valeurs par défaut identiques à celles de mmc_batch_core (BackendRust/src/lib.rs)
+const DEFAUTS = {
+  titreAlias: 'Add Alias Title',
+  descriptionAlias: 'Agent  advance pilote',
+  titreProfil: 'SetProfile Title',
+  descriptionProfil: 'SetProfile rollback'
+}
+
+const parametres = reactive({
+  montant: '100000',
+  profil: '',
+  raison: '',
+  ...DEFAUTS
+})
+
+const sansGuillemet = (v) => !v.includes('"')
+const sansVirgule = (v) => !/[,"]/.test(v)
+
+// Profil et raison d'abord : ce sont eux qui changent d'un lot à l'autre.
+const champsParMode = {
+  standard: [],
+  crplmt: [
+    {
+      cle: 'montant',
+      label: 'Montant',
+      placeholder: '100000',
+      numerique: true,
+      valide: (v) => /^\d+$/.test(v.trim()),
+      erreur: 'Le montant doit être un nombre entier (ex. 100000).'
+    },
+    { cle: 'titreAlias', label: 'Titre', valide: sansGuillemet, erreur: 'Le titre ne doit pas contenir de guillemets.' },
+    {
+      cle: 'descriptionAlias',
+      label: 'Description',
+      valide: sansGuillemet,
+      erreur: 'La description ne doit pas contenir de guillemets.'
+    }
+  ],
+  migration: [
+    {
+      cle: 'profil',
+      label: 'Profil',
+      placeholder: 'ex. MTNC Agent Promo Profile 1.5',
+      valide: sansVirgule,
+      erreur: 'Le profil ne doit contenir ni virgule ni guillemet : il décalerait les colonnes.'
+    },
+    {
+      cle: 'raison',
+      label: 'Raison',
+      placeholder: 'ex. FIELD AZURE MIGRATION',
+      valide: sansVirgule,
+      erreur: 'La raison ne doit contenir ni virgule ni guillemet : elle décalerait les colonnes.'
+    },
+    { cle: 'titreProfil', label: 'Titre', valide: sansGuillemet, erreur: 'Le titre ne doit pas contenir de guillemets.' },
+    {
+      cle: 'descriptionProfil',
+      label: 'Description',
+      valide: sansGuillemet,
+      erreur: 'La description ne doit pas contenir de guillemets.'
+    }
+  ]
+}
+
+const champs = computed(() => champsParMode[modeConversion.value])
+const champValide = (champ) => champ.valide(parametres[champ.cle])
+const erreursChamps = computed(() => champs.value.filter((c) => !champValide(c)).map((c) => c.erreur))
+const peutDeposer = computed(() => erreursChamps.value.length === 0)
+
+// Champ d'en-tête laissé vide : le backend reprend la valeur par défaut.
+const ouDefaut = (cle) => (parametres[cle].trim() ? parametres[cle] : DEFAUTS[cle])
+
+// --- Aperçu du fichier produit ------------------------------------------------------
+// Chaque ligne est une suite de morceaux : texte fixe (chaîne), réglage saisi
+// ci-dessus ({ saisie }) ou valeur reprise du classeur ({ fichier }).
+
+const NUMERO = '237XXXXXXXXX'
+
+const apercu = computed(() => {
+  const p = parametres
+  if (modeConversion.value === 'crplmt') {
+    return [
+      ['HDR,"AddAlias","', { saisie: ouDefaut('titreAlias') }, '","ExtId12340","', { fichier: 'n' }, '","', { saisie: ouDefaut('descriptionAlias') }, '","1"'],
+      ['MSISDN,"', { fichier: NUMERO }, '","CRPLMT_', { fichier: NUMERO }, '@', { saisie: p.montant.trim() }, '"']
+    ]
+  }
+  if (modeConversion.value === 'migration') {
+    return [
+      ['HDR,"SetProfile","', { saisie: ouDefaut('titreProfil') }, '","ExtId20240724","', { fichier: 'n' }, '","', { saisie: ouDefaut('descriptionProfil') }, '","1"'],
+      ['MSISDN,', { fichier: NUMERO }, ',', { saisie: p.profil.trim() }, ',', { saisie: p.raison.trim() }]
+    ]
+  }
+  const parametre = { fichier: '<Paramètre>' }
+  const entete =
+    styleEntete.value === 'Set'
+      ? ['HDR,UpdateIndividualRatingParameter,', { saisie: 'Set' }, ' ', parametre, ',ExtId12341,', { fichier: 'n' }, ',', parametre, ' enable,1']
+      : ['HDR,"UpdateIndividualRatingParameter","', { saisie: 'Init' }, ' ', parametre, ' TRUE","ExtId12340","', { fichier: 'n' }, '"," ', parametre, ' init","1"']
+  return [entete, [{ fichier: 'lignes de la feuille, telles quelles' }]]
+})
 
 // --- État de l'écran -----------------------------------------------------------
 
@@ -57,16 +168,28 @@ const inputFichier = ref(null)
 const nomZip = ref('')
 const tailleZipKo = ref(0)
 const nbFeuilles = ref(0)
+const nbLignes = ref(0)
 const messageErreur = ref('')
 const urlTelechargement = ref(null)
 const progression = ref(0)
 const statutProgression = ref('')
 
 const formatKo = (octets) => (octets / 1024).toFixed(0)
+const pluriel = (n, mot) => `${n.toLocaleString('fr-FR')} ${mot}${n > 1 ? 's' : ''}`
 const pourcentageRestant = computed(() => Math.max(0, 100 - progression.value))
-const libelleZone = computed(() =>
-  etat.value === 'survol' ? 'Relâche pour déposer' : 'Glisse ton fichier ici, ou clique pour parcourir'
-)
+const libelleZone = computed(() => {
+  if (!peutDeposer.value) return 'Corrige les réglages ci-dessus pour déposer un fichier'
+  return etat.value === 'survol' ? 'Relâche pour déposer' : 'Glisse ton fichier ici, ou clique pour parcourir'
+})
+
+// « 476 numéros » pour une colonne de numéros, « 3 feuilles · 1 204 lignes » en Standard
+const resumeConversion = computed(() => {
+  const standard = modeConversion.value === 'standard'
+  const parties = []
+  if (standard || nbFeuilles.value > 1) parties.push(pluriel(nbFeuilles.value, standard ? 'feuille' : 'fichier'))
+  if (nbLignes.value) parties.push(pluriel(nbLignes.value, standard ? 'ligne' : 'numéro'))
+  return parties.join(' · ')
+})
 
 // --- Historique ------------------------------------------------------------------
 
@@ -130,12 +253,12 @@ function fermerNotification() {
 // --- Sélection du fichier -----------------------------------------------------------
 
 function ouvrirSelecteur() {
-  inputFichier.value?.click()
+  if (peutDeposer.value) inputFichier.value?.click()
 }
 
 function onSurvolEntree(e) {
   e.preventDefault()
-  if (etat.value === 'repos') etat.value = 'survol'
+  if (etat.value === 'repos' && peutDeposer.value) etat.value = 'survol'
 }
 
 function onSurvolSortie(e) {
@@ -146,7 +269,7 @@ function onSurvolSortie(e) {
 function onDepot(e) {
   e.preventDefault()
   const f = e.dataTransfer?.files?.[0]
-  if (f) traiterFichier(f)
+  if (f && peutDeposer.value) traiterFichier(f)
   else if (etat.value === 'survol') etat.value = 'repos'
 }
 
@@ -166,27 +289,30 @@ async function traiterFichier(f) {
   if (!/\.(xlsx|xls)$/i.test(f.name)) {
     return afficherErreur('Format non pris en charge. Dépose un fichier .xlsx ou .xls.')
   }
-  if (modeConversion.value === 'crplmt' && !montantValide.value) {
-    return afficherErreur('Le montant doit être un nombre entier (ex. 100000).')
-  }
+  if (erreursChamps.value.length) return afficherErreur(erreursChamps.value[0])
 
   fichier.value = f
   etat.value = 'conversion'
   const arreterProgression = demarrerProgression()
+  const p = parametres
+  const migration = modeConversion.value === 'migration'
 
   try {
     const resultat = await convertir({
       fichier: f,
       mode: modeConversion.value,
       styleEntete: styleEntete.value,
-      montant: montant.value.trim(),
-      titre: titreAlias.value,
-      description: descriptionAlias.value
+      montant: p.montant.trim(),
+      titre: migration ? p.titreProfil : p.titreAlias,
+      description: migration ? p.descriptionProfil : p.descriptionAlias,
+      profil: p.profil,
+      raison: p.raison
     })
     await arreterProgression(true)
 
     nomZip.value = resultat.nomZip
     nbFeuilles.value = resultat.nbFeuilles
+    nbLignes.value = resultat.nbLignes
     tailleZipKo.value = resultat.blob.size
     urlTelechargement.value = URL.createObjectURL(resultat.blob)
     etat.value = 'termine'
@@ -277,24 +403,24 @@ function reinitialiser() {
         @supprimer="supprimerDeHistorique"
       />
 
-      <main class="flex-1 overflow-y-auto">
+      <main class="flex-1 overflow-y-auto [scrollbar-gutter:stable]">
         <div class="max-w-lg mx-auto px-6 py-16">
           <h1 class="font-display text-3xl font-semibold tracking-tight text-ink mb-2 leading-tight">
-            Chaque feuille devient<br />un CSV autonome.
+            {{ modeActif.titre[0] }}<br />{{ modeActif.titre[1] }}
           </h1>
           <p class="text-sm leading-relaxed text-ink-soft max-w-[46ch] mb-10">
-            Dépose un classeur Excel. Chaque feuille en ressort avec son propre titre généré
-            et son propre fichier, regroupés dans un zip.
+            {{ modeActif.intro }}
           </p>
 
-          <!-- Sélecteur du type de fichier d'entrée -->
-          <div v-if="etat === 'repos' || etat === 'survol'" :class="modeConversion === 'crplmt' ? 'mb-6' : 'mb-4'">
-            <div class="flex items-center gap-1 border border-line rounded-md p-0.5 w-fit">
+          <!-- Réglages : type de fichier, puis style d'en-tête ou champs du mode -->
+          <div v-if="etat === 'repos' || etat === 'survol'" class="mb-6">
+            <div class="flex items-center gap-1 border border-line rounded-md p-0.5 w-fit" role="group" aria-label="Type de fichier">
               <button
                 v-for="mode in modes"
                 :key="mode.valeur"
                 type="button"
                 @click="modeConversion = mode.valeur"
+                :aria-pressed="modeConversion === mode.valeur"
                 :class="[
                   'flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium transition-colors',
                   modeConversion === mode.valeur
@@ -306,62 +432,75 @@ function reinitialiser() {
                 {{ mode.label }}
               </button>
             </div>
-            <p class="mt-2 font-mono text-[11px] text-ink-soft">
-              {{ modes.find(m => m.valeur === modeConversion)?.description }}
-            </p>
+            <p class="mt-2 font-mono text-[11px] text-ink-soft">{{ modeActif.description }}</p>
 
-            <div v-if="modeConversion === 'crplmt'" class="mt-3 grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-2 max-w-sm">
-              <label for="champ-montant" class="text-xs font-medium text-ink">Montant</label>
-              <input
-                id="champ-montant"
-                v-model="montant"
-                type="text"
-                inputmode="numeric"
-                placeholder="100000"
-                :class="[
-                  'w-32 rounded-md border bg-paper px-2 py-1 font-mono text-xs text-ink outline-none focus:border-blue',
-                  montantValide ? 'border-line' : 'border-danger'
-                ]"
-              />
-              <label for="champ-titre" class="text-xs font-medium text-ink">Titre</label>
-              <input
-                id="champ-titre"
-                v-model="titreAlias"
-                type="text"
-                class="rounded-md border border-line bg-paper px-2 py-1 font-mono text-xs text-ink outline-none focus:border-blue"
-              />
-              <label for="champ-description" class="text-xs font-medium text-ink">Description</label>
-              <input
-                id="champ-description"
-                v-model="descriptionAlias"
-                type="text"
-                class="rounded-md border border-line bg-paper px-2 py-1 font-mono text-xs text-ink outline-none focus:border-blue"
-              />
+            <!-- Style d'en-tête (Standard uniquement) -->
+            <div v-if="modeConversion === 'standard'" class="mt-4">
+              <div class="flex items-center gap-1 border border-line rounded-md p-0.5 w-fit" role="group" aria-label="Style d'en-tête">
+                <button
+                  v-for="opt in options"
+                  :key="opt.valeur"
+                  type="button"
+                  @click="styleEntete = opt.valeur"
+                  :aria-pressed="styleEntete === opt.valeur"
+                  :class="[
+                    'flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium transition-colors',
+                    styleEntete === opt.valeur
+                      ? 'bg-blue text-white'
+                      : 'text-ink-soft hover:text-ink'
+                  ]"
+                >
+                  <component :is="opt.icone" :size="13" :stroke-width="2.25" />
+                  {{ opt.label }}
+                </button>
+              </div>
+              <p class="mt-2 font-mono text-[11px] text-ink-soft">
+                {{ options.find(o => o.valeur === styleEntete)?.description }}
+              </p>
             </div>
-          </div>
 
-          <!-- Sélecteur du style d'en-tête (process standard uniquement) -->
-          <div v-if="(etat === 'repos' || etat === 'survol') && modeConversion === 'standard'" class="mb-6">
-            <div class="flex items-center gap-1 border border-line rounded-md p-0.5 w-fit">
-              <button
-                v-for="opt in options"
-                :key="opt.valeur"
-                type="button"
-                @click="styleEntete = opt.valeur"
-                :class="[
-                  'flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium transition-colors',
-                  styleEntete === opt.valeur
-                    ? 'bg-blue text-white'
-                    : 'text-ink-soft hover:text-ink'
-                ]"
-              >
-                <component :is="opt.icone" :size="13" :stroke-width="2.25" />
-                {{ opt.label }}
-              </button>
+            <!-- Champs du mode (CRPLMT, Migration) -->
+            <template v-else>
+              <div class="mt-4 grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-2 max-w-sm">
+                <template v-for="champ in champs" :key="champ.cle">
+                  <label :for="`champ-${champ.cle}`" class="text-xs font-medium text-ink">{{ champ.label }}</label>
+                  <input
+                    :id="`champ-${champ.cle}`"
+                    v-model="parametres[champ.cle]"
+                    type="text"
+                    :inputmode="champ.numerique ? 'numeric' : 'text'"
+                    :placeholder="champ.placeholder"
+                    spellcheck="false"
+                    :aria-invalid="!champValide(champ)"
+                    :aria-describedby="champValide(champ) ? undefined : 'erreurs-champs'"
+                    :class="[
+                      'min-w-0 rounded-md border bg-paper px-2 py-1 font-mono text-xs text-ink placeholder:text-ink-soft outline-none transition-colors focus:border-blue',
+                      champ.numerique && 'w-32',
+                      champValide(champ) ? 'border-line' : 'border-danger'
+                    ]"
+                  />
+                </template>
+              </div>
+              <ul v-if="erreursChamps.length" id="erreurs-champs" class="mt-2 space-y-0.5 text-xs text-danger" aria-live="polite">
+                <li v-for="erreur in erreursChamps" :key="erreur">{{ erreur }}</li>
+              </ul>
+            </template>
+
+            <!-- Aperçu : les deux premières lignes du fichier, recalculées à la frappe -->
+            <div class="mt-6">
+              <div class="mb-1.5 flex items-baseline justify-between gap-3">
+                <p class="text-xs font-medium text-ink">Aperçu du fichier</p>
+                <p class="text-[11px] text-ink-soft">
+                  <span class="font-medium text-blue">bleu</span> : tes réglages · gris : repris du classeur
+                </p>
+              </div>
+              <div class="rounded-md border border-line bg-paper px-3 py-2.5 font-mono text-[11px] leading-5 text-ink">
+                <div v-for="(ligne, i) in apercu" :key="i" class="grid grid-cols-[1rem_1fr] gap-2">
+                  <span class="select-none text-right text-ink-soft/60" aria-hidden="true">{{ i + 1 }}</span>
+                  <span class="whitespace-pre-wrap [overflow-wrap:anywhere]"><template v-for="(morceau, j) in ligne" :key="j"><template v-if="typeof morceau === 'string'">{{ morceau }}</template><span v-else-if="'saisie' in morceau" class="font-medium text-blue">{{ morceau.saisie }}</span><span v-else class="text-ink-soft">{{ morceau.fichier }}</span></template></span>
+                </div>
+              </div>
             </div>
-            <p class="mt-2 font-mono text-[11px] text-ink-soft">
-              {{ options.find(o => o.valeur === styleEntete)?.description }}
-            </p>
           </div>
 
           <!-- Zone de dépôt : bande structurelle, pas une carte flottante -->
@@ -374,10 +513,16 @@ function reinitialiser() {
             @click="ouvrirSelecteur"
             role="button"
             tabindex="0"
+            :aria-disabled="!peutDeposer"
             @keydown.enter="ouvrirSelecteur"
+            @keydown.space.prevent="ouvrirSelecteur"
             :class="[
-              'flex items-center gap-4 rounded-md border px-6 py-8 cursor-pointer transition-colors',
-              etat === 'survol' ? 'border-yellow bg-blue-dim' : 'border-line bg-paper-dim hover:border-blue/40'
+              'flex items-center gap-4 rounded-md border px-6 py-8 transition-colors',
+              !peutDeposer
+                ? 'cursor-not-allowed border-line bg-paper-dim opacity-60'
+                : etat === 'survol'
+                  ? 'cursor-pointer border-yellow bg-blue-dim'
+                  : 'cursor-pointer border-line bg-paper-dim hover:border-blue/40'
             ]"
           >
             <input
@@ -434,7 +579,7 @@ function reinitialiser() {
               <div class="min-w-0">
                 <p class="text-sm font-medium text-ink">Conversion terminée</p>
                 <p class="font-mono text-[11px] text-ink-soft truncate">
-                  {{ nomZip }} — {{ formatKo(tailleZipKo) }} Ko<span v-if="nbFeuilles"> — {{ nbFeuilles }} feuilles</span>
+                  {{ nomZip }} — {{ formatKo(tailleZipKo) }} Ko<span v-if="resumeConversion"> — {{ resumeConversion }}</span>
                 </p>
               </div>
             </div>
